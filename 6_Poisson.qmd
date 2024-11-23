@@ -1,0 +1,366 @@
+---
+title: "계층적 푸아송 모형"
+format: html
+editor: source
+---
+```{r}
+library(tidyverse)
+library(readxl)
+library(MCMCvis)
+library(brms)
+library(tidybayes)
+library(wesanderson)
+library(showtext)
+library(sjPlot)
+showtext_auto()
+options(scipen=9999)
+
+theme_clean <- function() {
+  theme_minimal(base_family = "News Cycle") +
+    theme(panel.grid.minor = element_blank(),
+          plot.title = element_text(face = "bold"),
+          axis.title = element_text(face = "bold"),
+          strip.text = element_text(face = "bold", size = rel(1), hjust = 0),
+          strip.background = element_rect(fill = "grey80", color = NA),
+          legend.title = element_text(face = "bold"))
+}
+```
+
+```{r}
+coded <- read_excel("matched_all.xlsx")
+nesdc <- read_csv("nesdc_collapsed.csv")
+```
+
+# 가능한 모든 언론사-여론조사 pair 만들기
+```{r}
+poll_id_incld <- coded |>
+    select(번호1:번호36) |>
+    pivot_longer(번호1:번호36, values_to="id_poll") |>
+    filter(!is.na(id_poll)) |>
+    pull () |>
+    unique() 
+```
+
+```{r}
+pairs_ip <- expand_grid(provider=unique(coded$provider),
+            id_poll=poll_id_incld) |>
+    filter(id_poll != 9030)                  # 이런 poll은 nesd 데이터에 없음.
+```
+
+```{r}
+pairs_cover <- coded |>
+    select(번호, provider, 번호1:번호36) |>
+    pivot_longer(번호1:번호36, values_to="id_poll") |>
+    filter(!is.na(id_poll)) |>
+    select(!name) |>
+    group_by(provider, id_poll) |>
+    summarise(n=n())
+```
+
+```{r}
+covers <- pairs_ip |>
+    left_join(pairs_cover, by=c("provider", "id_poll"), multiple="first") |>
+    #rename(id_news = 번호) |>
+    mutate(n=ifelse(is.na(n), 0, n), cover=ifelse(n==0, 0, 1))
+```
+
+
+# 여론조사 기관의 결합 편향 구하기
+```{r}
+sampling_nesdc <- readRDS("poll_prin.rds")
+summary_nesdc <- MCMCsummary(sampling_nesdc)
+```
+
+`3_워크샵_데이터_결합.qmd` 에서 생성된 `nesdc_d`에서 가져온 것.
+```{r}
+biases_comb <- sampling_nesdc |>
+    spread_draws(alpha[house, cand]) |>
+    filter(cand %in% c(3,4)) |>
+    pivot_wider(names_from="cand", values_from="alpha") |>
+    mutate(alpha = `3`-`4`) |>
+    mean_qi(alpha) |>
+    left_join(nesdc_d |>
+                  select(house, 선거여론조사기관) |>
+                  group_by(house) |>
+                  slice(1), by="house") |>
+    filter(.width==0.95) |>
+    mutate(comb=alpha, 선거여론조사기관) |>
+    select(comb, 선거여론조사기관)
+```
+
+```{r}
+house_effects <- summary_nesdc |>
+    rownames_to_column("coef") |>
+    filter(grepl('alpha', coef)) |>
+    mutate(coef=str_replace(coef, "alpha\\[",""),
+           coef=str_replace(coef, "\\]","")) |>
+    separate_wider_delim(coef, ",", names=c("house","id_cand")) |>
+    mutate(house=as.numeric(house), id_cand=as.numeric(id_cand)) |>
+    filter(id_cand %in% c(3,4)) |> 
+    left_join(nesdc_d |>
+                  select(house, 선거여론조사기관) |>
+                  group_by(house) |>
+                  slice(1), by="house") |>
+    select(id_cand, house, mean, `50%`, 선거여론조사기관) |>
+    rename(median=`50%`) |>
+    mutate(cand = case_match(id_cand, 3 ~ "yoon",
+                             4 ~ "lee")) |>
+    select(!c(median, id_cand)) |>
+    pivot_wider(names_from="cand", values_from="mean") |>
+    left_join(biases_comb, by = "선거여론조사기관")
+
+dt <- covers |>
+    left_join(nesdc |>
+                  select(이재명, 윤석열, 등록번호,
+                         선거여론조사기관, 조사의뢰자, 조사방법new) |>
+                  mutate(선거여론조사기관=str_replace(선거여론조사기관, ",.*$", ""), 
+                         선거여론조사기관=case_when(선거여론조사기관 %in% c("(주)코리아리서치인터내셔널","(주)코리아리서치인터네셔널") ~ "코리아리서치",
+                              선거여론조사기관 == "(주)코리아정보리서치중부본부" ~ "(주)코리아정보리서치",
+                              선거여론조사기관 == "(주)한국갤럽조사연구소" ~ "한국갤럽조사연구소",
+                              선거여론조사기관 == "넥스트인터랙티브리서치(넥스트리서치)" ~ "넥스트리서치",
+                              선거여론조사기관 == "(주)엠브레인퍼블릭" ~ "엠브레인퍼블릭",
+                              선거여론조사기관 == "(주)리얼미터" ~ "리얼미터",
+                              선거여론조사기관 == "케이스텟리서치" ~ "케이스탯리서치",
+                              선거여론조사기관 == "케이에스오아이주식회사(한국사회여론연구소)" ~ "한국사회여론연구소",
+                              선거여론조사기관 == "모노커뮤니케이션즈(모노리서치)" ~ "모노리서치",
+                              .default = 선거여론조사기관
+                              )) |> 
+                  separate_longer_delim(선거여론조사기관, delim=","), by = c("id_poll"="등록번호")) |>
+    left_join(house_effects, by = "선거여론조사기관") |>
+    group_by(provider, id_poll, cover, 이재명, 윤석열, 조사의뢰자, n) |>
+    summarise(yoon=mean(yoon, na.rm=TRUE), lee=mean(lee, na.rm=TRUE),
+              house_diff=mean(comb, na.rm=TRUE)) |>
+    ungroup() |>
+    mutate(조사의뢰자=str_replace(조사의뢰자, ".*:",""),
+           matched = grepl(provider, 조사의뢰자),
+           bc = case_when(provider %in% c("KBS","MBC","OBS","SBS","YTN") ~ 1,
+                          .default = 0))
+dt
+```
+
+보도 빈도 시각화 (Figure 1)
+```{r}
+dt |>
+    ggplot() +
+    aes(x=n) +
+    geom_histogram(binwidth = 1) +
+    labs(x="각 여론조사 보도 빈도", y="") +
+    theme_classic()
+```
+
+# 회귀 실행
+```{r}
+# get_prior(data=dt |> 
+#                 mutate(diff = 윤석열-이재명),
+#             family=poisson(link = "log"),
+#             n ~ 1 + matched + (1 + diff + yoon | provider),
+#           prior=priors)
+```
+```{r}
+priors <- c(prior(normal(0, 5), class = b),
+            prior(normal(0, 5), class = Intercept),
+            #prior(normal(0.5, 0.5), class = b, coef=days_per_week),
+            #prior(normal(0, 2), class = sigma),
+            prior(normal(0, 2), class = sd, lb=0),
+            prior(lkj(3), class = cor))
+```
+
+```{r}
+# validate_prior(n ~ 1 + matched + (diff + house_diff | provider), data=dt |> 
+#                 mutate(diff = 윤석열-이재명),
+#               prior=priors,
+#             family=poisson(link = "log"))
+```
+
+```{r}
+# make_stancode(n ~ 1 + matched + (diff + house_diff | provider), data=dt |> 
+#                 mutate(diff = 윤석열-이재명),
+#               prior=priors,
+#             family=poisson(link = "log"))
+```
+
+```{r}
+fit1 <- brm(data=dt |> 
+                mutate(diff = 윤석열-이재명),
+            family=poisson(link = "log"),
+            n ~ 1 + bc + matched + (diff + yoon| provider), 
+            prior=priors,
+            cores=4, iter=10000)
+saveRDS(fit1, "poisson_poll.rds")
+
+fit2 <- brm(data=dt |> 
+                mutate(diff = 윤석열-이재명),
+            family=poisson(link = "log"),
+            n ~ 1 + bc + matched + (diff + lee | provider),
+            prior=priors,
+           cores=4, iter=10000)
+saveRDS(fit2, "poisson_poll_lee.rds")
+
+fit3 <- brm(data=dt |> 
+                mutate(diff = 윤석열-이재명),
+            family=poisson(link = "log"),
+            n ~ 1 + bc + matched + (diff + house_diff | provider), 
+            prior=priors,
+            cores=4, iter=10000)
+
+saveRDS(fit3, "poisson_poll_diff.rds")
+```
+
+
+# 결과 시각화
+```{r}
+fit1 <- readRDS("poisson_poll.rds")
+fit2 <- readRDS("poisson_poll_lee.rds")
+fit3 <- readRDS("poisson_poll_diff.rds")
+```
+```{r}
+tab_model(fit1, fit2, fit3, file="table.doc",
+          string.est="Estimate")
+```
+```{r}
+agg1 <- fit1 |>
+    spread_draws(r_provider[firm, cond]) |> 
+    filter(cond != "Intercept") |>
+    median_qi(r_provider, .width = c(.95, .8, .5)) |>
+    mutate(cond = case_match(cond, "diff" ~ "양후보 격차",
+                             "yoon" ~ "하우스 효과"),
+           house="윤석열 후보 편향")
+    
+agg2 <- fit2 |>
+    spread_draws(r_provider[firm, cond]) |> 
+    filter(cond != "Intercept") |>
+    median_qi(r_provider, .width = c(.95, .8, .5)) |>
+    mutate(cond = case_match(cond, "diff" ~ "양후보 격차",
+                             "lee" ~ "하우스 효과"),
+           house="이재명 후보 편향")
+
+agg3 <- fit3 |>
+    spread_draws(r_provider[firm, cond]) |> 
+    filter(cond != "Intercept") |>
+    median_qi(r_provider, .width = c(.95, .8, .5)) |>
+    mutate(cond = case_match(cond, "diff" ~ "양후보 격차",
+                             "house_diff" ~ "하우스 효과"),
+           house="결합 편향")
+
+agg <- rbind(agg1, agg2, agg3)
+```
+
+시각화 순서 결정
+```{r}
+firm_order <- agg |>
+    filter(.width==0.95 & house=="결합 편향" & cond=="하우스 효과") |>
+    arrange(r_provider) |>
+    pull(firm)
+agg$firm <- fct_relevel(agg$firm, firm_order)
+```
+
+최종 시각화 (Figure 3)
+```{r}
+agg |>
+    ggplot() +
+    aes(y=firm, x = r_provider, xmin = .lower, xmax = .upper) +
+    geom_pointinterval(aes(color=cond), point_size=0.5, size=0.5) +
+    geom_vline(xintercept=0, linetype="dashed") +
+    facet_wrap(vars(fct_relevel(house, "윤석열 후보 편향", "이재명 후보 편향", "결합 편향"))) +
+    labs(x="", y="") +
+    scale_color_manual(values = wes_palette("Royal1")) +
+    theme_classic() +
+    theme(legend.title=element_blank(), legend.position="bottom",
+          legend.text=element_text(size=13), axis.text.y=element_text(size=11),
+          axis.text.x=element_text(size=11), strip.text=element_text(size=13),
+          legend.key.size = unit(2, 'cm'),
+          panel.spacing = unit(2, "lines"),
+          plot.margin = unit(c(0.1, 0.2, 0, 0.1), 
+                                "inches"))
+ggsave("biases_poi.pdf", width=8, height=9)
+```
+
+
+
+# 예측 시각화
+여론조사 결과는 동등하고 여론조사 기관 편향만 있을 때.
+```{r}
+preds <- fit3 |>
+    epred_draws(newdata = expand_grid(matched=c(FALSE,TRUE), 
+                                       diff=0,
+                                       house_diff=seq(-5,5, by=0.05),
+                                       bc=0,
+                                       provider=c("조선일보","중앙일보",
+                                       "동아일보", "한겨레", "경향신문")),
+                re_formula = NULL)
+```
+
+```{r}
+preds |>
+    mutate(matched = case_match(matched, FALSE ~ "미요청",
+                                TRUE ~ "요청")) |>
+    ggplot() +
+    aes(x=house_diff, y=.epred, fill=fct_relevel(matched, "요청", "미요청")) +
+    stat_lineribbon(alpha=0.5) +
+    facet_wrap(vars(fct_relevel(provider, "조선일보","동아일보","중앙일보",
+                                "한겨레","경향신문")), nrow=1) +
+    scale_fill_manual(values=c("#CC6666", "#7777DD")) +
+    ylim(0,5) +
+    labs(x = "결합편향지수(%)", y = "기대보도횟수",
+       fill = "", color="요청여부") +
+    theme_clean() +
+    theme(legend.position="bottom",
+          legend.text=element_text(size=15), legend.title=element_text(size=15), 
+          axis.text.y=element_text(size=15),
+          axis.text.x=element_text(size=15), strip.text=element_text(size=17),
+          legend.key.size = unit(1, 'cm'))
+```
+
+```{r}
+preds |>
+    filter(house_diff %in% c(-5, 5),
+           provider %in% c("조선일보","중앙일보","동아일보","한겨레","경향신문")) |>
+    group_by(provider, house_diff) |>
+    summarise(mean = mean(.epred), sd = sd(.epred),
+              low = quantile(.epred, prob=0.025), high=quantile(.epred, prob=0.975))
+```
+
+
+여론조사 기관 편향은 없고, 여론조사 결과 차이만 있을 때.
+```{r}
+preds <- fit3 |>
+    epred_draws(newdata = expand_grid(matched=c(FALSE,TRUE), 
+                                       diff=seq(-5,5, by=0.05),
+                                       house_diff=0,
+                                       bc=0,
+                                       provider=c("조선일보","중앙일보",
+                                       "동아일보", "한겨레", "경향신문")),
+                re_formula = NULL)
+```
+
+```{r}
+preds |>
+    mutate(matched = case_match(matched, FALSE ~ "미요청",
+                                TRUE ~ "요청")) |>
+    ggplot() +
+    aes(x=diff, y=.epred, fill=fct_relevel(matched, "요청", "미요청")) +
+    stat_lineribbon(alpha=0.5) +
+    facet_wrap(vars(fct_relevel(provider, "조선일보","동아일보","중앙일보",
+                                "한겨레","경향신문")),nrow=1) +
+    scale_fill_manual(values=c("#CC6666", "#7777DD")) +
+    #scale_fill_brewer(palette = "RdBu") +
+    ylim(0,5) +
+    labs(x = "양후보격차(%)", y = "기대보도횟수",
+       fill = "", color="요청여부") +
+    theme_clean() +
+    theme(legend.position="bottom",
+          legend.text=element_text(size=15), legend.title=element_text(size=15), 
+          axis.text.y=element_text(size=15),
+          axis.text.x=element_text(size=15), strip.text=element_text(size=17),
+          legend.key.size = unit(1, 'cm'))
+```
+
+```{r}
+preds |>
+    filter(diff %in% c(-5, 5),
+           provider %in% c("조선일보","중앙일보","동아일보","한겨레","경향신문")) |>
+    group_by(provider, diff) |>
+    summarise(mean = mean(.epred), sd = sd(.epred),
+              low = quantile(.epred, prob=0.025), high=quantile(.epred, prob=0.975))
+```
+

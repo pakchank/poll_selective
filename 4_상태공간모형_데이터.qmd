@@ -1,0 +1,144 @@
+---
+title: "상태공간 모형용 데이터 생성"
+format: html
+editor: source
+---
+
+```{r}
+library(tidyverse)
+```
+
+# 데이터 중복 해결
+선관위 스크래이핑의 결과물인 `nesdc_scraped.csv` 파일을 코딩 결과와 매칭하기 위해 중복 (MBC 데이터는 house 효과 분석을 위해서 양자 대결의 경우, 삼자 대결의 경우 등 중복 결과를 포함시키고 있음)을 제거하는 작업만을 여기서 한다.
+
+```{r}
+nesdc_scraped <- read_csv("nesdc_scraped.csv")
+```
+
+```{r}
+df_reduced <- nesdc_scraped |>
+    mutate(across(이재명:없음, ~ifelse(.x=="-", NA, .x))) |>
+    filter(!is.na(이재명) & !is.na(윤석열)) |>
+    group_by(등록번호) |>
+    filter(row_number() == n())
+```
+
+```{r}
+write.csv(df_reduced, "nesdc_collapsed.csv")
+```
+
+# 상태-공간 모형을 만들기 위한 데이터 정리 작업
+## 주조사기관 추출 방법
+```{r}
+nesdc_prin <- nesdc_scraped |>
+    mutate(선거여론조사기관=str_replace(선거여론조사기관, ",.*$", ""), 
+           선거여론조사기관=case_when(선거여론조사기관 %in% c("(주)코리아리서치인터내셔널","(주)코리아리서치인터네셔널") ~ "코리아리서치",
+                              선거여론조사기관 == "(주)코리아정보리서치중부본부" ~ "(주)코리아정보리서치",
+                              선거여론조사기관 == "(주)한국갤럽조사연구소" ~ "한국갤럽조사연구소",
+                              선거여론조사기관 == "넥스트인터랙티브리서치(넥스트리서치)" ~ "넥스트리서치",
+                              선거여론조사기관 == "(주)엠브레인퍼블릭" ~ "엠브레인퍼블릭",
+                              선거여론조사기관 == "(주)리얼미터" ~ "리얼미터",
+                              선거여론조사기관 == "케이스텟리서치" ~ "케이스탯리서치",
+                              선거여론조사기관 == "케이에스오아이주식회사(한국사회여론연구소)" ~ "한국사회여론연구소",
+                              선거여론조사기관 == "모노커뮤니케이션즈(모노리서치)" ~ "모노리서치",
+                              .default = 선거여론조사기관
+                              )) 
+```
+
+```{r}
+nesdc_d <- nesdc_prin |>
+    select(날짜, 선거여론조사기관, 등록번호, 표본크기, 이재명, 윤석열, 안철수, 심상정) |>
+    mutate(across(이재명:심상정, ~ifelse(.x=="-", NA, .x)),
+           across(이재명:심상정, ~ifelse(is.na(.x), 1, 0), 
+                  .names="{.col}_d")) |>                    # Menu 효과를 측정하기 위해 생략된 후보 dummy 생성
+    mutate(날짜 = ymd(gsub(".*~", "", 날짜))) |> 
+    rowwise() |>
+    mutate(full = ifelse(sum(c(이재명_d, 윤석열_d, 안철수_d, 심상정_d))==0, 1, 0)) |>
+    ungroup() |>
+    group_by(날짜) |>
+    mutate(date=cur_group_id()) |>
+    group_by(등록번호) |>
+    mutate(poll = cur_group_id()) |>
+    group_by(선거여론조사기관) |>
+    mutate(house=cur_group_id()) |>
+    ungroup() |>
+    pivot_longer(이재명:심상정, names_to="candidate", values_to="prop") |>
+    group_by(candidate) |>
+    mutate(id_cand=cur_group_id()) |>
+    ungroup() |>
+    filter(!is.na(prop)) |>
+    arrange(날짜, 등록번호, full, id_cand) |>
+    mutate(prop=as.numeric(prop))
+```
+
+```{r}
+stan_data <- list(y=nesdc_d$prop,
+                  D=nesdc_d |> 
+                      select(이재명_d:심상정_d) |> 
+                      as.matrix(),
+                  poll=nesdc_d$poll, date=nesdc_d$date, id_cand=nesdc_d$id_cand, house=nesdc_d$house,
+                  N=nrow(nesdc_d), T=max(nesdc_d$date), J=max(nesdc_d$poll), C=max(nesdc_d$id_cand),
+                  I=max(nesdc_d$house))
+```
+
+```{r}
+saveRDS(stan_data, "stan_data_house.rds")
+```
+
+## 개별 여론조사기관 개별 카운트 방식
+```{r}
+nesdc_indp <- nesdc_scraped |>
+    mutate(선거여론조사기관=str_replace(선거여론조사기관, ",$", "")) |>
+    separate_longer_delim(선거여론조사기관, delim=",") |>
+    mutate(선거여론조사기관=str_replace(선거여론조사기관, ",.*$", ""), 
+           선거여론조사기관=case_when(선거여론조사기관 %in% c("(주)코리아리서치인터내셔널","(주)코리아리서치인터네셔널") ~ "코리아리서치",
+                              선거여론조사기관 == "(주)코리아정보리서치중부본부" ~ "(주)코리아정보리서치",
+                              선거여론조사기관 == "(주)한국갤럽조사연구소" ~ "한국갤럽조사연구소",
+                              선거여론조사기관 == "넥스트인터랙티브리서치(넥스트리서치)" ~ "넥스트리서치",
+                              선거여론조사기관 == "(주)엠브레인퍼블릭" ~ "엠브레인퍼블릭",
+                              선거여론조사기관 == "(주)리얼미터" ~ "리얼미터",
+                              선거여론조사기관 == "케이스텟리서치" ~ "케이스탯리서치",
+                              선거여론조사기관 == "케이에스오아이주식회사(한국사회여론연구소)" ~ "한국사회여론연구소",
+                              선거여론조사기관 == "모노커뮤니케이션즈(모노리서치)" ~ "모노리서치",
+                              .default = 선거여론조사기관
+                              )) 
+```
+
+```{r}
+nesdc_d <- nesdc_indp |>
+    select(날짜, 선거여론조사기관, 등록번호, 표본크기, 이재명, 윤석열, 안철수, 심상정) |>
+    mutate(across(이재명:심상정, ~ifelse(.x=="-", NA, .x)),
+           across(이재명:심상정, ~ifelse(is.na(.x), 1, 0), 
+                  .names="{.col}_d")) |>                    # Menu 효과를 측정하기 위해 생략된 후보 dummy 생성
+    mutate(날짜 = ymd(gsub(".*~", "", 날짜))) |> 
+    rowwise() |>
+    mutate(full = ifelse(sum(c(이재명_d, 윤석열_d, 안철수_d, 심상정_d))==0, 1, 0)) |>
+    ungroup() |>
+    group_by(날짜) |>
+    mutate(date=cur_group_id()) |>
+    group_by(등록번호) |>
+    mutate(poll = cur_group_id()) |>
+    group_by(선거여론조사기관) |>
+    mutate(house=cur_group_id()) |>
+    ungroup() |>
+    pivot_longer(이재명:심상정, names_to="candidate", values_to="prop") |>
+    group_by(candidate) |>
+    mutate(id_cand=cur_group_id()) |>
+    ungroup() |>
+    filter(!is.na(prop)) |>
+    arrange(날짜, 등록번호, full, id_cand) 
+```
+
+```{r}
+stan_data <- list(y=nesdc_d$prop,
+                  D=nesdc_d |> 
+                      select(이재명_d:심상정_d) |> 
+                      as.matrix(),
+                  poll=nesdc_d$poll, date=nesdc_d$date, id_cand=nesdc_d$id_cand, house=nesdc_d$house,
+                  N=nrow(nesdc_d), T=max(nesdc_d$date), J=max(nesdc_d$poll), C=max(nesdc_d$id_cand),
+                  I=max(nesdc_d$house))
+```
+
+```{r}
+saveRDS(stan_data, "stan_data_house_append.rds")
+```

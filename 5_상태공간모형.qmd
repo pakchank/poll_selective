@@ -1,0 +1,145 @@
+---
+title: "상태공간 모형"
+format: html
+editor: source
+---
+
+조사기관 편향을 구하기 위해 상태공간모형을 추정하는 코드입니다.
+
+```{r}
+library(tidyverse)
+library(rstan)
+library(MCMCvis)
+library(tidybayes)
+options(scipen=9999)
+options(mc.cores = parallel::detectCores())
+```
+
+```{r}
+stan_data <- readRDS("stan_data_house.rds")
+# stan_data <- readRDS("stan_data_house_append.rds") # 공동 조사기관을 독립적으로 다루는 경우.
+```
+
+```{stan, output.var="poll_model"}
+data {
+  int<lower=0> N;  // 전체 데이터 수
+  int<lower=0> T;  // 전체 시간 수
+  int<lower=0> I;  // 전체 house 수
+  //int<lower=0> J;  // 전체 poll 수
+  int<lower=0> C;  // 전체 후보 수
+  
+  //int<lower=0> poll[N];    // poll ID
+  int<lower=0> house[N];
+  int<lower=0> date[N];    // number of days
+  int<lower=0> id_cand[N]; // 후보 ID
+  
+  matrix[N,C] D;
+  vector[N] y;
+}
+parameters {
+  matrix[I,C] alpha; // house 효과: house x cand  
+  matrix[C,T] gamma; // true state: cand x date
+  matrix[C,C] beta;
+  
+  real<lower=0> sig_e;
+  real<lower=0> sig_ep;
+}
+
+transformed parameters {
+  matrix[C,C] beta_c = beta;    
+  for(c in 1:C){
+    beta_c[c,c]=0;     //자기 자신에 대한 menu효과를 0으로 제한하기 위한 부분.
+    }
+}
+model {
+  vector[N] mu; // the mean of the polls
+  // priors
+  to_vector(gamma[,1]) ~ normal(25, 10);
+  to_vector(alpha) ~ normal(0, 1);
+  to_vector(beta) ~ normal(0,1);
+
+  sig_ep ~ student_t(3, 0, 1); 
+  sig_e ~ student_t(3, 0, 1);
+
+  // measurement model
+  for(n in 1:N) {
+    mu[n] = alpha[house[n], id_cand[n]] + gamma[id_cand[n], date[n]] + dot_product(D[n], beta[id_cand[n]]);
+    y[n] ~ normal(mu[n], sig_e);  
+  }
+  
+  // state model
+  for(t in 2:T) {
+    for(c in 1:C) {
+      gamma[c,t] ~ normal(gamma[c, (t-1)], sig_ep);
+    }
+  }
+}
+```
+
+```{r}
+sample_poll <- sampling(poll_model, data = stan_data,
+                pars = c("alpha", "gamma", "beta"),
+                iter = 5000, warmup = 2500)
+```
+
+```{r}
+#saveRDS(sample_poll, "poll_prin.rds")
+#sample_poll <- readRDS("poll_prin.rds")
+```
+
+```{r}
+MCMCsummary(sample_poll) |> View()
+```
+
+# House Effect 시각화
+결합 편향 계산
+```{r}
+bias_diff <- sample_poll |>
+    spread_draws(alpha[house, cand]) |>
+    filter(cand %in% c(3,4)) |>
+    pivot_wider(names_from="cand", values_from="alpha") |>
+    mutate(alpha = `3`-`4`) |>
+    median_qi(alpha, .width = c(.95, .8, .5)) |>
+    mutate(cand=5)
+```
+
+시각화 순서 결정
+```{r}
+house_order <- bias_diff |>
+    filter(.width==0.95) |>
+    left_join(nesdc_d |>
+                  select(house, 선거여론조사기관) |>
+                  group_by(house) |>
+                  slice(1), by="house") |>
+    arrange(alpha) |>
+    pull(선거여론조사기관)
+```
+
+최종 시각화 (Figure 2: 조사기관 편향)
+```{r}
+sample_poll |>
+    spread_draws(alpha[house, cand]) |> 
+    filter(cand %in% c(3,4)) |>  
+    median_qi(alpha, .width = c(.95, .8, .5)) |>
+    bind_rows(bias_diff) |>
+    left_join(nesdc_d |>
+                  select(house, 선거여론조사기관) |>
+                  group_by(house) |>
+                  slice(1), by="house") |>
+    mutate(cand = case_match(cand, 3 ~ "윤석열 후보 편향",
+                             4 ~ "이재명 후보 편향",
+                             5 ~ "결합편향")) |>
+    ggplot(aes(y = fct_relevel(선거여론조사기관, house_order), x = alpha, xmin = .lower, xmax = .upper)) +
+    geom_pointinterval(aes(color=alpha), point_size=0.5, size=0.5) +
+    geom_vline(xintercept=0, linetype="dashed") +
+    facet_wrap(vars(fct_relevel(cand, "윤석열 후보 편향", "이재명 후보 편향", "결합편향"))) +
+    labs(x="", y="") +
+    scale_color_gradient2() +
+    theme_classic() +
+    theme(legend.title=element_blank(), legend.position="none",
+          legend.text=element_text(size=13), axis.text.y=element_text(size=11),
+          axis.text.x=element_text(size=11), strip.text=element_text(size=13),
+          legend.key.size = unit(2, 'cm'), 
+          panel.spacing = unit(1.5, "lines"))
+ggsave("house_effects.pdf", width=9, height=7)
+```

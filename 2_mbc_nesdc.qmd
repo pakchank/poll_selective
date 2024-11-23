@@ -1,0 +1,27 @@
+---
+title: "MBC 선관위 데이터 스크레이핑 최종"
+format: html
+editor: visual
+---
+
+MBC 스크레이핑은 `1_scraping_nesdc`로 했고, 그 결과물인 `nesdc_scraped.csv` 파일을 코딩 결과와 매칭하기 위해 연결시키기 위해 중복 (MBC 데이터는 house 효과 분석을 위해서 양자 대결의 경우, 삼자 대결의 경우 등 중복 결과를 포함시키고 있음)을 제거하는 작업만을 여기서 한다.
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+df <- read_csv("nesdc_scraped.csv")
+```
+
+```{r}
+df_reduced <- df |>
+    mutate(across(이재명:없음, ~ifelse(.x=="-", NA, .x))) |>
+    filter(!is.na(이재명) & !is.na(윤석열)) |>
+    group_by(등록번호) |>
+    filter(row_number() == n())
+```
+
+```{r}
+write.csv(df_reduced, "nesdc_collapsed.csv")
+```
